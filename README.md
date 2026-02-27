@@ -29,7 +29,7 @@ Packets are assigned monotonic sequence numbers, distributed across subflows by 
 | Scheduler interface + Round-robin | `scheduler/` | ✅ Done |
 | Subflow state machine | `subflow.go` | ✅ Done |
 | MultipathConn core | `conn.go` | ✅ Done |
-| Handshake (dial + listen) | `dialer.go`, `listener.go` | 🔲 Pending |
+| Handshake (dial + listen) | `dialer.go`, `listener.go` | ✅ Done |
 | Flow control + Failover | `conn.go` additions | 🔲 Pending |
 
 ## Requirements
