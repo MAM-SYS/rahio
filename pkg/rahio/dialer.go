@@ -3,6 +3,7 @@ package rahio
 import (
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -36,8 +37,16 @@ func Dial(addr string, numSubflows int, localAddrs []string, sched scheduler.Sch
 		return nil, fmt.Errorf("rahio: generating connection ID: %w", err)
 	}
 
+	slog.Info("dial: starting",
+		"addr", addr,
+		"numSubflows", numSubflows,
+		"localAddrs", localAddrs,
+		"connID", connIDStr(connID),
+	)
+
 	if sched == nil {
 		sched = scheduler.NewRoundRobin()
+		slog.Debug("dial: using default round-robin scheduler", "connID", connIDStr(connID))
 	}
 
 	// Dial all subflows in parallel so the server sees them close together.
@@ -61,45 +70,67 @@ func Dial(addr string, numSubflows int, localAddrs []string, sched scheduler.Sch
 	subflows := make([]*Subflow, numSubflows)
 	var firstErr error
 	for i, r := range results {
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
+		if r.err != nil {
+			slog.Error("dial: subflow failed", "idx", i, "connID", connIDStr(connID), "err", r.err)
+			if firstErr == nil {
+				firstErr = r.err
+			}
 		}
-
 		subflows[i] = r.sf
 	}
 
 	if firstErr != nil {
+		slog.Warn("dial: one or more subflows failed, closing all", "connID", connIDStr(connID))
 		for _, sf := range subflows {
 			if sf != nil {
 				_ = sf.TCPConn.Close()
 			}
 		}
-
 		return nil, firstErr
 	}
 
+	slog.Info("dial: all subflows established, MultipathConn ready",
+		"connID", connIDStr(connID),
+		"numSubflows", numSubflows,
+	)
 	return NewMultipathConn(connID, subflows, sched), nil
 }
 
 // dialSubflow handles the full TCP dial → HANDSHAKE → HANDSHAKE_ACK exchange
 // for a single subflow (§4.1).
 func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs []string) (*Subflow, error) {
+	localAddr := ""
+	if idx < len(localAddrs) {
+		localAddr = localAddrs[idx]
+	}
+
+	slog.Debug("dialSubflow: connecting",
+		"idx", idx,
+		"addr", addr,
+		"localAddr", localAddr,
+		"connID", connIDStr(connID),
+	)
+
 	dialer := &net.Dialer{Timeout: handshakeTimeout}
-	if idx < len(localAddrs) && localAddrs[idx] != "" {
-		localTCP, err := net.ResolveTCPAddr("tcp", localAddrs[idx])
+	if localAddr != "" {
+		localTCP, err := net.ResolveTCPAddr("tcp", localAddr)
 		if err != nil {
-
-			return nil, fmt.Errorf("rahio: resolving local addr %q for subflow %d: %w", localAddrs[idx], idx, err)
+			return nil, fmt.Errorf("rahio: resolving local addr %q for subflow %d: %w", localAddr, idx, err)
 		}
-
 		dialer.LocalAddr = localTCP
 	}
 
 	tcpConn, err := dialer.Dial("tcp", addr)
 	if err != nil {
-
 		return nil, fmt.Errorf("rahio: dialing subflow %d: %w", idx, err)
 	}
+
+	slog.Debug("dialSubflow: TCP connected",
+		"idx", idx,
+		"local", tcpConn.LocalAddr(),
+		"remote", tcpConn.RemoteAddr(),
+		"connID", connIDStr(connID),
+	)
 
 	// HANDSHAKE packet: header carries Version, Type, SubflowIndex, ConnectionID.
 	// Data[0] = NumSubflows — the only field from §4.1 not already in the header.
@@ -113,9 +144,13 @@ func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs 
 	}
 	if err = WritePacket(tcpConn, hsPkt); err != nil {
 		_ = tcpConn.Close()
-
 		return nil, fmt.Errorf("rahio: sending HANDSHAKE for subflow %d: %w", idx, err)
 	}
+	slog.Debug("dialSubflow: sent HANDSHAKE",
+		"idx", idx,
+		"numSubflows", numSubflows,
+		"connID", connIDStr(connID),
+	)
 
 	// Wait for HANDSHAKE_ACK (§5.2 type 0x02).
 	_ = tcpConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
@@ -123,24 +158,30 @@ func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs 
 	_ = tcpConn.SetReadDeadline(time.Time{}) // clear deadline for data phase
 	if err != nil {
 		_ = tcpConn.Close()
-
 		return nil, fmt.Errorf("rahio: reading HANDSHAKE_ACK for subflow %d: %w", idx, err)
 	}
 
 	if ack.Type != TypeHandshakeAck {
 		_ = tcpConn.Close()
-
 		return nil, fmt.Errorf("rahio: subflow %d: expected HANDSHAKE_ACK (0x02), got 0x%02x", idx, ack.Type)
 	}
 
 	if ack.ConnectionID != connID {
 		_ = tcpConn.Close()
-
 		return nil, fmt.Errorf("rahio: subflow %d: HANDSHAKE_ACK connection ID mismatch", idx)
 	}
 
+	slog.Debug("dialSubflow: received HANDSHAKE_ACK", "idx", idx, "connID", connIDStr(connID))
+
 	lAddr := tcpConn.LocalAddr().(*net.TCPAddr)
 	rAddr := tcpConn.RemoteAddr().(*net.TCPAddr)
+
+	slog.Info("dialSubflow: subflow established",
+		"idx", idx,
+		"local", lAddr,
+		"remote", rAddr,
+		"connID", connIDStr(connID),
+	)
 
 	return &Subflow{
 		Index:      uint8(idx),
@@ -149,4 +190,9 @@ func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs 
 		RemoteAddr: rAddr.IP,
 		State:      SubflowActive,
 	}, nil
+}
+
+// connIDStr returns the first 4 bytes of a connection ID as a hex string for logging.
+func connIDStr(id [16]byte) string {
+	return fmt.Sprintf("%x", id[:4])
 }

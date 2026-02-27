@@ -3,7 +3,9 @@ package rahio
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -61,6 +63,14 @@ func NewMultipathConn(id [16]byte, subflows []*Subflow, sched scheduler.Schedule
 	}
 	c.fcCond = sync.NewCond(&c.fcMu)
 	sched.Init(c)
+
+	slog.Info("conn: MultipathConn created",
+		"connID", connIDStr(id),
+		"numSubflows", len(subflows),
+		"recvWindow", defaultRecvWindow,
+		"sendWindow", defaultSendWindow,
+	)
+
 	for _, sf := range subflows {
 		go c.recvLoop(sf)
 	}
@@ -100,6 +110,11 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 	default:
 	}
 
+	slog.Debug("conn: Write called",
+		"connID", connIDStr(c.ConnectionID),
+		"bytes", len(b),
+	)
+
 	total := 0
 	for len(b) > 0 {
 		n := len(b)
@@ -113,12 +128,18 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 		// §9.2: Block until there is room in the send window.
 		c.fcMu.Lock()
 		for c.inFlight+int64(n) > c.sendWindow {
+			slog.Debug("conn: Write blocking on flow control",
+				"connID", connIDStr(c.ConnectionID),
+				"seq", seq,
+				"chunkSize", n,
+				"inFlight", c.inFlight,
+				"sendWindow", c.sendWindow,
+			)
 			c.fcCond.Wait()
 			// Re-check closed after waking.
 			select {
 			case <-c.closed:
 				c.fcMu.Unlock()
-
 				return total, ErrClosed
 			default:
 			}
@@ -132,13 +153,24 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 		idx := c.sched.SelectSubflow(c)
 		if idx < 0 || idx >= len(c.Subflows) {
 			c.mu.Unlock()
-
+			slog.Error("conn: no active subflows available",
+				"connID", connIDStr(c.ConnectionID),
+				"seq", seq,
+			)
 			return total, ErrNoSubflows
 		}
 
 		sf := c.Subflows[idx]
 		sf.Scheduled = false // clear after selection
 		c.mu.Unlock()
+
+		slog.Debug("conn: sending chunk",
+			"connID", connIDStr(c.ConnectionID),
+			"seq", seq,
+			"size", n,
+			"sfIdx", sf.Index,
+		)
+
 		pkt := &Packet{
 			Version:        ProtocolVersion,
 			Type:           TypeData,
@@ -149,6 +181,12 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 			Data:           chunk,
 		}
 		if err := WritePacket(sf.TCPConn, pkt); err != nil {
+			slog.Error("conn: WritePacket failed",
+				"connID", connIDStr(c.ConnectionID),
+				"seq", seq,
+				"sfIdx", sf.Index,
+				"err", err,
+			)
 			return total, err
 		}
 
@@ -156,6 +194,10 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 		total += n
 	}
 
+	slog.Debug("conn: Write complete",
+		"connID", connIDStr(c.ConnectionID),
+		"totalWritten", total,
+	)
 	return total, nil
 }
 
@@ -169,12 +211,20 @@ func (c *MultipathConn) Read(b []byte) (int, error) {
 		return 0, io.EOF
 	case data, ok := <-c.reassembly.output:
 		if !ok {
+			slog.Debug("conn: Read — reassembly channel closed, returning EOF",
+				"connID", connIDStr(c.ConnectionID),
+			)
 			return 0, io.EOF
 		}
 
 		n := copy(b, data)
 		// Application consumed len(data) bytes; reclaim that space in our window.
 		c.recvBufBytes.Add(-int64(len(data)))
+		slog.Debug("conn: Read delivered bytes",
+			"connID", connIDStr(c.ConnectionID),
+			"delivered", n,
+			"recvBufBytes", c.recvBufBytes.Load(),
+		)
 		return n, nil
 	}
 }
@@ -184,9 +234,20 @@ func (c *MultipathConn) Read(b []byte) (int, error) {
 // recvLoop reads packets from one subflow and feeds them into the reassembly
 // buffer. One goroutine per subflow (§3 receive path).
 func (c *MultipathConn) recvLoop(sf *Subflow) {
+	slog.Info("conn: recvLoop started",
+		"connID", connIDStr(c.ConnectionID),
+		"sfIdx", sf.Index,
+		"local", sf.TCPConn.LocalAddr(),
+		"remote", sf.TCPConn.RemoteAddr(),
+	)
+
 	for {
 		select {
 		case <-c.closed:
+			slog.Debug("conn: recvLoop stopping (connection closed)",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+			)
 			return
 		default:
 		}
@@ -196,10 +257,21 @@ func (c *MultipathConn) recvLoop(sf *Subflow) {
 			c.mu.Lock()
 			sf.State = SubflowClosed
 			c.mu.Unlock()
+			slog.Warn("conn: recvLoop read error, subflow closed",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+				"err", err,
+			)
 			return
 		}
 
 		if !VerifyChecksum(pkt) {
+			slog.Warn("conn: recvLoop checksum mismatch, dropping packet",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+				"seq", pkt.SequenceNumber,
+				"type", fmt.Sprintf("0x%02x", pkt.Type),
+			)
 			continue
 		}
 
@@ -207,6 +279,13 @@ func (c *MultipathConn) recvLoop(sf *Subflow) {
 
 		switch pkt.Type {
 		case TypeData:
+			slog.Debug("conn: recvLoop received TypeData",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+				"seq", pkt.SequenceNumber,
+				"dataLen", pkt.DataLength,
+				"recvBufBytes", c.recvBufBytes.Load(),
+			)
 			// Insert into reassembly and account for received bytes.
 			c.recvBufBytes.Add(int64(pkt.DataLength))
 			c.reassembly.insert(pkt.SequenceNumber, pkt.Data)
@@ -214,12 +293,28 @@ func (c *MultipathConn) recvLoop(sf *Subflow) {
 			c.sendAck(sf)
 
 		case TypeAck:
+			slog.Debug("conn: recvLoop received TypeAck",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+				"ackedSeq", pkt.SequenceNumber,
+			)
 			// Peer acknowledged our data; update send-side flow control (§9.2).
 			c.handleAck(pkt)
 
 		case TypeClose:
+			slog.Info("conn: recvLoop received TypeClose",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+			)
 			_ = c.Close()
 			return
+
+		default:
+			slog.Debug("conn: recvLoop received unknown packet type",
+				"connID", connIDStr(c.ConnectionID),
+				"sfIdx", sf.Index,
+				"type", fmt.Sprintf("0x%02x", pkt.Type),
+			)
 		}
 	}
 }
@@ -234,6 +329,13 @@ func (c *MultipathConn) sendAck(sf *Subflow) {
 	if available < 0 {
 		available = 0
 	}
+
+	slog.Debug("conn: sendAck",
+		"connID", connIDStr(c.ConnectionID),
+		"sfIdx", sf.Index,
+		"ackedSeq", ackedSeq,
+		"advertisedWindow", available,
+	)
 
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, uint32(available))
@@ -254,6 +356,10 @@ func (c *MultipathConn) sendAck(sf *Subflow) {
 // SendWindow   = binary.BigEndian.Uint32(pkt.Data[0:4])
 func (c *MultipathConn) handleAck(pkt *Packet) {
 	if len(pkt.Data) < 4 {
+		slog.Warn("conn: handleAck received ACK with no window data",
+			"connID", connIDStr(c.ConnectionID),
+			"ackedSeq", pkt.SequenceNumber,
+		)
 		return
 	}
 
@@ -261,6 +367,7 @@ func (c *MultipathConn) handleAck(pkt *Packet) {
 	ackedSeq := pkt.SequenceNumber
 
 	c.fcMu.Lock()
+	prevInFlight := c.inFlight
 	// Remove all acknowledged entries and reduce bytesInFlight.
 	for seq, size := range c.sentPackets {
 		if seq <= ackedSeq {
@@ -276,12 +383,22 @@ func (c *MultipathConn) handleAck(pkt *Packet) {
 	c.sendWindow = advertisedWindow
 	c.fcCond.Broadcast() // wake any Write() calls waiting for window space
 	c.fcMu.Unlock()
+
+	slog.Debug("conn: handleAck — flow control updated",
+		"connID", connIDStr(c.ConnectionID),
+		"ackedSeq", ackedSeq,
+		"advertisedWindow", advertisedWindow,
+		"inFlightBefore", prevInFlight,
+		"inFlightAfter", c.inFlight,
+		"pendingPackets", len(c.sentPackets),
+	)
 }
 
 // ── net.Conn: Close (§4.3) ───────────────────────────────────────────────────
 
 func (c *MultipathConn) Close() error {
 	c.closeOnce.Do(func() {
+		slog.Info("conn: closing MultipathConn", "connID", connIDStr(c.ConnectionID))
 		close(c.closed)
 		c.fcCond.Broadcast() // unblock any Write() waiting on the send window
 		c.sched.Release(c)
@@ -298,12 +415,17 @@ func (c *MultipathConn) Close() error {
 		for _, sf := range c.Subflows {
 			if sf.State == SubflowActive {
 				sf.State = SubflowClosing
+				slog.Debug("conn: sending TypeClose to subflow",
+					"connID", connIDStr(c.ConnectionID),
+					"sfIdx", sf.Index,
+				)
 				_ = WritePacket(sf.TCPConn, closePkt)
 				_ = sf.TCPConn.Close()
 				sf.State = SubflowClosed
 			}
 		}
 		c.reassembly.close()
+		slog.Info("conn: MultipathConn closed", "connID", connIDStr(c.ConnectionID))
 	})
 	return nil
 }
@@ -394,6 +516,7 @@ func (rb *reassemblyBuffer) insert(seq uint64, data []byte) {
 		rb.nextExpected++
 
 		// Flush any consecutive buffered packets.
+		flushed := 0
 		for {
 			d, ok := rb.buffer[rb.nextExpected]
 			if !ok {
@@ -402,11 +525,27 @@ func (rb *reassemblyBuffer) insert(seq uint64, data []byte) {
 			rb.output <- d
 			delete(rb.buffer, rb.nextExpected)
 			rb.nextExpected++
+			flushed++
+		}
+		if flushed > 0 {
+			slog.Debug("reassembly: flushed buffered packets",
+				"flushed", flushed,
+				"nextExpected", rb.nextExpected,
+			)
 		}
 	} else if seq > rb.nextExpected {
+		slog.Debug("reassembly: buffering out-of-order packet",
+			"seq", seq,
+			"nextExpected", rb.nextExpected,
+			"bufferLen", len(rb.buffer),
+		)
 		rb.buffer[seq] = data
+	} else {
+		slog.Debug("reassembly: dropping duplicate/old packet",
+			"seq", seq,
+			"nextExpected", rb.nextExpected,
+		)
 	}
-	// seq < nextExpected: duplicate/old — discard
 }
 
 // highestContiguous returns the last sequence number that has been delivered
@@ -418,7 +557,6 @@ func (rb *reassemblyBuffer) highestContiguous() uint64 {
 	if rb.nextExpected == 0 {
 		return 0
 	}
-
 	return rb.nextExpected - 1
 }
 
