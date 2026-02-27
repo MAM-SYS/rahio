@@ -30,7 +30,8 @@ Packets are assigned monotonic sequence numbers, distributed across subflows by 
 | Subflow state machine | `subflow.go` | ✅ Done |
 | MultipathConn core | `conn.go` | ✅ Done |
 | Handshake (dial + listen) | `dialer.go`, `listener.go` | ✅ Done |
-| Flow control + Failover | `conn.go` additions | 🔲 Pending |
+| Flow control | `conn.go` | ✅ Done |
+| Failover | `conn.go` additions | 🔲 Pending |
 
 ## Requirements
 
