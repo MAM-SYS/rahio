@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hossein/rahio/scheduler"
+	"github.com/hossein/rahio/pkg/rahio/scheduler"
 )
 
 const handshakeTimeout = 10 * time.Second

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hossein/rahio/scheduler"
+	"github.com/hossein/rahio/pkg/rahio/scheduler"
 )
 
 // pendingConnTimeout is how long the listener waits for all NumSubflows to
