@@ -149,10 +149,10 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 		c.fcMu.Unlock()
 
 		// Select subflow via scheduler.
-		c.mu.Lock()
+		// c.mu.Lock()
 		idx := c.sched.SelectSubflow(c)
 		if idx < 0 || idx >= len(c.Subflows) {
-			c.mu.Unlock()
+			// c.mu.Unlock()
 			slog.Error("conn: no active subflows available",
 				"connID", connIDStr(c.ConnectionID),
 				"seq", seq,
@@ -162,7 +162,7 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 
 		sf := c.Subflows[idx]
 		sf.Scheduled = false // clear after selection
-		c.mu.Unlock()
+		// c.mu.Unlock()
 
 		slog.Debug("conn: sending chunk",
 			"connID", connIDStr(c.ConnectionID),
