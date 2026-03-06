@@ -512,7 +512,10 @@ func (rb *reassemblyBuffer) insert(seq uint64, data []byte) {
 	defer rb.mu.Unlock()
 
 	if seq == rb.nextExpected {
-		rb.output <- data
+		select {
+		case rb.output <- data:
+		default:
+		}
 		rb.nextExpected++
 
 		// Flush any consecutive buffered packets.
@@ -522,7 +525,10 @@ func (rb *reassemblyBuffer) insert(seq uint64, data []byte) {
 			if !ok {
 				break
 			}
-			rb.output <- d
+			select {
+			case rb.output <- d:
+			default:
+			}
 			delete(rb.buffer, rb.nextExpected)
 			rb.nextExpected++
 			flushed++
