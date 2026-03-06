@@ -40,7 +40,7 @@ type pendingConn struct {
 // sched is shared across all accepted MultipathConns. Because every
 // well-formed scheduler (including RoundRobin) stores state per ConnectionID
 // (§7.2), sharing one instance is correct. Pass nil to use round-robin.
-func Listen(addr string, sched scheduler.SchedulerOps) (*Listener, error) {
+func Listen(addr string, sched scheduler.SchedulerOps) (net.Listener, error) {
 	if sched == nil {
 		sched = scheduler.NewRoundRobin()
 		slog.Debug("listen: using default round-robin scheduler")
@@ -67,7 +67,7 @@ func Listen(addr string, sched scheduler.SchedulerOps) (*Listener, error) {
 
 // Accept blocks until a fully-assembled MultipathConn is ready (all declared
 // subflows have completed the handshake) or the listener is closed.
-func (l *Listener) Accept() (*MultipathConn, error) {
+func (l *Listener) Accept() (net.Conn, error) {
 	select {
 	case <-l.closed:
 		return nil, fmt.Errorf("rahio: listener closed")
