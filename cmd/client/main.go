@@ -28,8 +28,13 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	remoteServer := flag.String("server", "", "Rahio server host:port (required)")
 	localProxy := flag.String("proxy", "127.0.0.1:1080", "Local proxy listen address")
+	chunkSize := flag.Int("chunk", rahio.DefaultChunkSize, "Chunk size")
+	recvWindow := flag.Uint("recv", rahio.DefaultRecvWindow, "Flow control receive Window size")
+	sendWindow := flag.Int("send", rahio.DefaultSendWindow, "Flow control send Window size")
+	handshakeTimout := flag.Duration("handshake-timout", rahio.DefaultHandshakeTimeout, "Handshake timeout")
 	ifaces := flag.String("ifaces", "", "Comma-separated interface names, e.g. eth0,wlan0 (required)")
 	flag.Parse()
+
 	if *remoteServer == "" {
 		slog.Error("client: --server is required")
 		os.Exit(1)
@@ -52,6 +57,7 @@ func main() {
 		addrs[i] = loc
 	}
 
+	cfg := rahio.NewDialerCfg(*chunkSize, uint32(*recvWindow), int64(*sendWindow), *handshakeTimout)
 	ln, err := net.Listen("tcp", *localProxy)
 	if err != nil {
 		slog.Error("server: failed to listen", "err", err)
@@ -63,6 +69,7 @@ func main() {
 		"proxy", *localProxy,
 		"ifaces", ifaceList,
 		"numSubflows", len(ifaceList),
+		"chunkSize", cfg.ConnCfg.ChunkSize,
 	)
 	for {
 		conn, err := ln.Accept()
@@ -71,7 +78,8 @@ func main() {
 			continue
 		}
 
-		mc, err := rahio.Dial(*remoteServer, len(ifaceList), addrs, nil)
+		dialer, err := rahio.NewDialer(len(ifaceList), addrs, nil, cfg)
+		mc, err := dialer.Dial("tcp", *remoteServer)
 		if err != nil {
 			slog.Error("rahio: Rahio dial failed", "server", remoteServer, "err", err)
 			continue

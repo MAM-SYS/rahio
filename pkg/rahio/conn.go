@@ -14,12 +14,6 @@ import (
 	"github.com/hossein/rahio/pkg/rahio/scheduler"
 )
 
-const (
-	chunkSize         = 32 * 1024       // 32 KB per chunk
-	defaultRecvWindow = 4 * 1024 * 1024 // 4 MB — our receive capacity, advertised to the peer
-	defaultSendWindow = 4 * 1024 * 1024 // 4 MB — optimistic initial send window before first ACK
-)
-
 var ErrNoSubflows = errors.New("rahio: no active subflows")
 var ErrClosed = errors.New("rahio: connection closed")
 
@@ -33,6 +27,7 @@ type MultipathConn struct {
 	sendSeq      atomic.Uint64 // monotonic send sequence counter (§8.1)
 	mu           sync.Mutex    // protects Subflows slice
 	reassembly   *reassemblyBuffer
+	config       *ConnCfg
 	closeOnce    sync.Once
 	closed       chan struct{}
 
@@ -50,16 +45,17 @@ type MultipathConn struct {
 }
 
 // NewMultipathConn creates a MultipathConn and starts the receive goroutines.
-func NewMultipathConn(id [16]byte, subflows []*Subflow, sched scheduler.SchedulerOps) *MultipathConn {
+func NewMultipathConn(id [16]byte, subflows []*Subflow, sched scheduler.SchedulerOps, cfg *ConnCfg) *MultipathConn {
 	c := &MultipathConn{
 		ConnectionID:    id,
 		Subflows:        subflows,
 		sched:           sched,
 		reassembly:      newReassemblyBuffer(),
 		closed:          make(chan struct{}),
-		sendWindow:      defaultSendWindow,
+		sendWindow:      cfg.SendWindow,
 		sentPackets:     make(map[uint64]uint32),
-		recvWindowBytes: defaultRecvWindow,
+		recvWindowBytes: cfg.RecvWindow,
+		config:          cfg,
 	}
 	c.fcCond = sync.NewCond(&c.fcMu)
 	sched.Init(c)
@@ -67,8 +63,9 @@ func NewMultipathConn(id [16]byte, subflows []*Subflow, sched scheduler.Schedule
 	slog.Info("conn: MultipathConn created",
 		"connID", connIDStr(id),
 		"numSubflows", len(subflows),
-		"recvWindow", defaultRecvWindow,
-		"sendWindow", defaultSendWindow,
+		"chunkSize", cfg.ChunkSize,
+		"recvWindow", cfg.RecvWindow,
+		"sendWindow", cfg.SendWindow,
 	)
 
 	for _, sf := range subflows {
@@ -118,10 +115,11 @@ func (c *MultipathConn) Write(b []byte) (int, error) {
 	total := 0
 	for len(b) > 0 {
 		n := len(b)
-		if n > chunkSize {
-			n = chunkSize
+		if n > c.config.ChunkSize {
+			n = c.config.ChunkSize
 		}
 		chunk := b[:n]
+		slog.Debug("conn: Write chunk", "chunkSize", n, "chunk", len(chunk))
 		b = b[n:]
 		seq := c.sendSeq.Add(1) - 1
 

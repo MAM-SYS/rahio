@@ -10,9 +10,8 @@ import (
 	"github.com/hossein/rahio/pkg/rahio/scheduler"
 )
 
-// pendingConnTimeout is how long the listener waits for all NumSubflows to
+// defaultPendingConnTimeout is how long the listener waits for all NumSubflows to
 // arrive before discarding a partially-assembled connection.
-const pendingConnTimeout = 30 * time.Second
 
 // Listener accepts incoming MultipathConn connections.
 // It wraps a single TCP listener; all subflows of every client connection
@@ -25,22 +24,15 @@ type Listener struct {
 	acceptCh    chan *MultipathConn
 	closed      chan struct{}
 	closeOnce   sync.Once
+	cfg         *ListenerCfg
 }
 
-// pendingConn collects subflows for one ConnectionID until all NumSubflows arrive.
-type pendingConn struct {
-	subflows    []*Subflow // slot per SubflowIndex
-	numExpected int
-	arrived     int
-	timer       *time.Timer // cleanup timer if group never completes
-}
-
-// Listen starts a Rahio listener on addr (e.g. ":9000").
+// NewListener starts a Rahio listener on addr (e.g. ":9000").
 //
 // sched is shared across all accepted MultipathConns. Because every
 // well-formed scheduler (including RoundRobin) stores state per ConnectionID
 // (§7.2), sharing one instance is correct. Pass nil to use round-robin.
-func Listen(addr string, sched scheduler.SchedulerOps) (net.Listener, error) {
+func NewListener(addr string, sched scheduler.SchedulerOps, cfg *ListenerCfg) (net.Listener, error) {
 	if sched == nil {
 		sched = scheduler.NewRoundRobin()
 		slog.Debug("listen: using default round-robin scheduler")
@@ -52,17 +44,22 @@ func Listen(addr string, sched scheduler.SchedulerOps) (net.Listener, error) {
 	}
 
 	slog.Info("listen: started", "addr", tcpL.Addr())
-
 	l := &Listener{
 		tcpListener: tcpL,
 		sched:       sched,
 		pending:     make(map[[16]byte]*pendingConn),
 		acceptCh:    make(chan *MultipathConn, 16),
 		closed:      make(chan struct{}),
+		cfg:         cfg,
 	}
 	go l.acceptLoop()
 
 	return l, nil
+}
+
+// Addr returns the listener's network address.
+func (l *Listener) Addr() net.Addr {
+	return l.tcpListener.Addr()
 }
 
 // Accept blocks until a fully-assembled MultipathConn is ready (all declared
@@ -83,9 +80,12 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 }
 
-// Addr returns the listener's network address.
-func (l *Listener) Addr() net.Addr {
-	return l.tcpListener.Addr()
+// pendingConn collects subflows for one ConnectionID until all NumSubflows arrive.
+type pendingConn struct {
+	subflows    []*Subflow // slot per SubflowIndex
+	numExpected int
+	arrived     int
+	timer       *time.Timer // cleanup timer if group never completes
 }
 
 // Close shuts down the listener. Already-accepted MultipathConns are not affected.
@@ -127,7 +127,7 @@ func (l *Listener) handleSubflow(tcpConn net.Conn) {
 	remote := tcpConn.RemoteAddr()
 
 	// Enforce a deadline so a slow/abusive client cannot hold resources.
-	_ = tcpConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	_ = tcpConn.SetReadDeadline(time.Now().Add(l.cfg.HandshakeTimeout))
 	pkt, err := ReadPacket(tcpConn)
 	_ = tcpConn.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -238,7 +238,7 @@ func (l *Listener) registerSubflow(connID [16]byte, sf *Subflow, numExpected int
 			numExpected: numExpected,
 		}
 		// If the group does not complete in time, clean up the partial state.
-		pc.timer = time.AfterFunc(pendingConnTimeout, func() {
+		pc.timer = time.AfterFunc(l.cfg.PendingConnTimeout, func() {
 			l.expirePending(connID)
 		})
 		l.pending[connID] = pc
@@ -280,7 +280,7 @@ func (l *Listener) registerSubflow(connID [16]byte, sf *Subflow, numExpected int
 		"connID", connIDStr(connID),
 		"numSubflows", numExpected,
 	)
-	return NewMultipathConn(connID, pc.subflows, l.sched)
+	return NewMultipathConn(connID, pc.subflows, l.sched, l.cfg.ConnCfg)
 }
 
 // expirePending closes the TCP connections belonging to a timed-out partial

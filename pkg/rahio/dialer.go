@@ -11,9 +11,7 @@ import (
 	"github.com/hossein/rahio/pkg/rahio/scheduler"
 )
 
-const handshakeTimeout = 10 * time.Second
-
-// Dial establishes a MultipathConn to addr using numSubflows TCP connections (§4.1).
+// Dialer establishes a MultipathConn to addr using numSubflows TCP connections (§4.1).
 //
 // All subflows connect to the same addr (same host:port), each carrying a
 // HANDSHAKE packet that includes the shared ConnectionID and the subflow's
@@ -26,11 +24,32 @@ const handshakeTimeout = 10 * time.Second
 //
 // sched selects which subflow each chunk is sent on; pass nil to use
 // round-robin (§7.3).
-func Dial(addr string, numSubflows int, localAddrs []string, sched scheduler.SchedulerOps) (*MultipathConn, error) {
+type Dialer struct {
+	numSubflows int
+	localAddrs  []string
+	sched       scheduler.SchedulerOps
+	cfg         *DialerCfg
+}
+
+func NewDialer(numSubflows int, localAddrs []string, sched scheduler.SchedulerOps, cfg *DialerCfg) (*Dialer, error) {
 	if numSubflows < 1 || numSubflows > 255 {
 		return nil, fmt.Errorf("rahio: numSubflows must be 1-255, got %d", numSubflows)
 	}
 
+	if sched == nil {
+		sched = scheduler.NewRoundRobin()
+		slog.Debug("dial: using default round-robin scheduler")
+	}
+
+	return &Dialer{
+		numSubflows: numSubflows,
+		localAddrs:  localAddrs,
+		sched:       sched,
+		cfg:         cfg,
+	}, nil
+}
+
+func (d *Dialer) Dial(network string, address string) (*MultipathConn, error) {
 	// Random 16-byte ConnectionID ties all subflows together (§4.1).
 	var connID [16]byte
 	if _, err := rand.Read(connID[:]); err != nil {
@@ -38,36 +57,31 @@ func Dial(addr string, numSubflows int, localAddrs []string, sched scheduler.Sch
 	}
 
 	slog.Info("dial: starting",
-		"addr", addr,
-		"numSubflows", numSubflows,
-		"localAddrs", localAddrs,
+		"addr", address,
+		"numSubflows", d.numSubflows,
+		"localAddrs", d.localAddrs,
 		"connID", connIDStr(connID),
 	)
-
-	if sched == nil {
-		sched = scheduler.NewRoundRobin()
-		slog.Debug("dial: using default round-robin scheduler", "connID", connIDStr(connID))
-	}
 
 	// Dial all subflows in parallel so the server sees them close together.
 	type result struct {
 		sf  *Subflow
 		err error
 	}
-	results := make([]result, numSubflows)
+	results := make([]result, d.numSubflows)
 	var wg sync.WaitGroup
-	for i := 0; i < numSubflows; i++ {
+	for i := 0; i < d.numSubflows; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			sf, err := dialSubflow(addr, idx, numSubflows, connID, localAddrs)
+			sf, err := d.dialSubflow(idx, connID, network, address)
 			results[idx] = result{sf, err}
 		}(i)
 	}
 	wg.Wait()
 
 	// Collect results; on any error close all successfully opened subflows.
-	subflows := make([]*Subflow, numSubflows)
+	subflows := make([]*Subflow, d.numSubflows)
 	var firstErr error
 	for i, r := range results {
 		if r.err != nil {
@@ -91,27 +105,28 @@ func Dial(addr string, numSubflows int, localAddrs []string, sched scheduler.Sch
 
 	slog.Info("dial: all subflows established, MultipathConn ready",
 		"connID", connIDStr(connID),
-		"numSubflows", numSubflows,
+		"numSubflows", d.numSubflows,
 	)
-	return NewMultipathConn(connID, subflows, sched), nil
+
+	return NewMultipathConn(connID, subflows, d.sched, d.cfg.ConnCfg), nil
 }
 
 // dialSubflow handles the full TCP dial → HANDSHAKE → HANDSHAKE_ACK exchange
 // for a single subflow (§4.1).
-func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs []string) (*Subflow, error) {
+func (d *Dialer) dialSubflow(idx int, connID [16]byte, network string, address string) (*Subflow, error) {
 	localAddr := ""
-	if idx < len(localAddrs) {
-		localAddr = localAddrs[idx]
+	if idx < len(d.localAddrs) {
+		localAddr = d.localAddrs[idx]
 	}
 
 	slog.Debug("dialSubflow: connecting",
 		"idx", idx,
-		"addr", addr,
+		"addr", address,
 		"localAddr", localAddr,
 		"connID", connIDStr(connID),
 	)
 
-	dialer := &net.Dialer{Timeout: handshakeTimeout}
+	dialer := &net.Dialer{Timeout: d.cfg.HandshakeTimeout}
 	if localAddr != "" {
 		localTCP, err := net.ResolveTCPAddr("tcp", localAddr)
 		if err != nil {
@@ -120,7 +135,7 @@ func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs 
 		dialer.LocalAddr = localTCP
 	}
 
-	tcpConn, err := dialer.Dial("tcp", addr)
+	tcpConn, err := dialer.Dial(network, address)
 	if err != nil {
 		return nil, fmt.Errorf("rahio: dialing subflow %d: %w", idx, err)
 	}
@@ -140,7 +155,7 @@ func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs 
 		SubflowIndex: uint8(idx),
 		ConnectionID: connID,
 		Timestamp:    uint64(time.Now().UnixMicro()),
-		Data:         []byte{uint8(numSubflows)},
+		Data:         []byte{uint8(d.numSubflows)},
 	}
 	if err = WritePacket(tcpConn, hsPkt); err != nil {
 		_ = tcpConn.Close()
@@ -148,12 +163,12 @@ func dialSubflow(addr string, idx, numSubflows int, connID [16]byte, localAddrs 
 	}
 	slog.Debug("dialSubflow: sent HANDSHAKE",
 		"idx", idx,
-		"numSubflows", numSubflows,
+		"numSubflows", d.numSubflows,
 		"connID", connIDStr(connID),
 	)
 
 	// Wait for HANDSHAKE_ACK (§5.2 type 0x02).
-	_ = tcpConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	_ = tcpConn.SetReadDeadline(time.Now().Add(d.cfg.HandshakeTimeout))
 	ack, err := ReadPacket(tcpConn)
 	_ = tcpConn.SetReadDeadline(time.Time{}) // clear deadline for data phase
 	if err != nil {
