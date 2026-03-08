@@ -495,12 +495,14 @@ type reassemblyBuffer struct {
 	nextExpected uint64
 	buffer       map[uint64][]byte
 	output       chan []byte
+	closed       chan struct{}
 }
 
 func newReassemblyBuffer() *reassemblyBuffer {
 	return &reassemblyBuffer{
 		buffer: make(map[uint64][]byte),
 		output: make(chan []byte, 256),
+		closed: make(chan struct{}),
 	}
 }
 
@@ -511,22 +513,29 @@ func (rb *reassemblyBuffer) insert(seq uint64, data []byte) {
 
 	if seq == rb.nextExpected {
 		select {
-		case rb.output <- data:
+		case <-rb.closed:
+			return
 		default:
 		}
+
+		rb.output <- data
 		rb.nextExpected++
 
 		// Flush any consecutive buffered packets.
 		flushed := 0
 		for {
+			select {
+			case <-rb.closed:
+				return
+			default:
+			}
+
 			d, ok := rb.buffer[rb.nextExpected]
 			if !ok {
 				break
 			}
-			select {
-			case rb.output <- d:
-			default:
-			}
+
+			rb.output <- d
 			delete(rb.buffer, rb.nextExpected)
 			rb.nextExpected++
 			flushed++
@@ -565,5 +574,6 @@ func (rb *reassemblyBuffer) highestContiguous() uint64 {
 }
 
 func (rb *reassemblyBuffer) close() {
+	close(rb.closed)
 	close(rb.output)
 }
