@@ -1,0 +1,119 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"strings"
+
+	"github.com/hossein/rahio/internal/proxy"
+	"github.com/hossein/rahio/pkg/rahio"
+)
+
+func banner() string {
+	return `
+██████╗  █████╗ ██╗   ██╗  ██╗ ██████╗ *
+██╔══██╗██╔══██╗██║   ██║  ██║██╔═══██╗
+██████╔╝███████║██║██║██║  ██║██║   ██║
+██╔══██╗██╔══██║██╔═══██║  ██║██║   ██║
+██║  ██║██║  ██║██║   ██║  ██║╚██████╔╝
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝   ╚═╝  ╚═╝ ╚═════╝  client
+`
+}
+
+func main() {
+	fmt.Println(banner())
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	remoteServer := flag.String("server", "", "Rahio server host:port (required)")
+	localProxy := flag.String("proxy", "127.0.0.1:1080", "Local proxy listen address")
+	chunkSize := flag.Int("chunk", rahio.DefaultChunkSize, "Chunk size")
+	recvWindow := flag.Uint("recv", rahio.DefaultRecvWindow, "Flow control receive Window size")
+	sendWindow := flag.Int("send", rahio.DefaultSendWindow, "Flow control send Window size")
+	handshakeTimout := flag.Duration("handshake-timout", rahio.DefaultHandshakeTimeout, "Handshake timeout")
+	ifaces := flag.String("ifaces", "", "Comma-separated interface names, e.g. eth0,wlan0 (required)")
+	flag.Parse()
+
+	if *remoteServer == "" {
+		slog.Error("client: --server is required")
+		os.Exit(1)
+	}
+
+	if *ifaces == "" {
+		slog.Error("client: --ifaces is required")
+		os.Exit(1)
+	}
+
+	ifaceList := strings.Split(*ifaces, ",")
+	addrs := make([]string, len(ifaceList))
+	for i, name := range ifaceList {
+		loc, err := ifaceToLocal(strings.TrimSpace(name))
+		if err != nil {
+			slog.Error("client: error parsing interface name", "iface", name, "err", err)
+			os.Exit(1)
+		}
+
+		addrs[i] = loc
+	}
+
+	cfg := rahio.NewDialerCfg(*chunkSize, uint32(*recvWindow), int64(*sendWindow), *handshakeTimout)
+	ln, err := net.Listen("tcp", *localProxy)
+	if err != nil {
+		slog.Error("server: failed to listen", "err", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Rahio client: starting",
+		"server", *remoteServer,
+		"proxy", *localProxy,
+		"ifaces", ifaceList,
+		"numSubflows", len(ifaceList),
+		"chunkSize", cfg.ConnCfg.ChunkSize,
+	)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			slog.Error("server: Accept failed, shutting down", "err", err)
+			continue
+		}
+
+		dialer, err := rahio.NewDialer(len(ifaceList), addrs, nil, cfg)
+		mc, err := dialer.Dial("tcp", *remoteServer)
+		if err != nil {
+			slog.Error("rahio: Rahio dial failed", "server", remoteServer, "err", err)
+			continue
+		}
+
+		go proxy.Proxy(mc, conn)
+		go proxy.Proxy(conn, mc)
+	}
+}
+
+func ifaceToLocal(i string) (string, error) {
+	iface, err := net.InterfaceByName(i)
+	if err != nil {
+		return "", fmt.Errorf("interface %q not found: %w", i, err)
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", fmt.Errorf("listing addrs for %q: %w", i, err)
+	}
+
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String() + ":0", nil
+		}
+	}
+
+	return "", fmt.Errorf("no IPv4 address on interface %q", i)
+}
