@@ -38,16 +38,6 @@ jobs:
       - name: Build and zip
         run: make build VERSION=$VERSION GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
 
-      - name: Read release note
-        id: read_release
-        shell: bash
-        run: |
-          r=$(cat RELEASE.md)         
-          r="${r//'%'/'%25'}"                               
-          r="${r//$'\n'/'%0A'}"                             
-          r="${r//$'\r'/'%0D'}"                             
-          echo "RELEASE_BODY=$r" >> $GITHUB_OUTPUT          
-
       - name: Upload Release Assets
         uses: svenstaro/upload-release-action@v2
         with:
@@ -59,4 +49,3 @@ jobs:
           file_glob: true
           prerelease: ${{ github.ref != 'refs/heads/main' }}
           promote: ${{ github.ref == 'refs/heads/main' }}
-          body: ${{ steps.read_release.outputs.RELEASE_BODY }}
