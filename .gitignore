@@ -26,3 +26,9 @@ go.work
 
 # editor
 .idea
+
+.DS_Store
+
+bin/
+dist/
+rahio
