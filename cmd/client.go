@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"flag"
@@ -12,7 +12,7 @@ import (
 	"github.com/hossein/rahio/pkg/rahio"
 )
 
-func banner() string {
+func clientBanner() string {
 	return `
 ██████╗  █████╗ ██╗   ██╗  ██╗ ██████╗ *
 ██╔══██╗██╔══██╗██║   ██║  ██║██╔═══██╗
@@ -23,8 +23,8 @@ func banner() string {
 `
 }
 
-func main() {
-	fmt.Println(banner())
+func StartClient() {
+	fmt.Println(clientBanner())
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	remoteServer := flag.String("server", "", "Rahio server host:port (required)")
 	localProxy := flag.String("proxy", "127.0.0.1:1080", "Local proxy listen address")

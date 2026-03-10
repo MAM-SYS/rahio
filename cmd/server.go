@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"flag"
@@ -10,7 +10,7 @@ import (
 	"github.com/hossein/rahio/pkg/rahio"
 )
 
-func banner() string {
+func serverBanner() string {
 	return `
 ██████╗  █████╗ ██╗   ██╗  ██╗ ██████╗ *
 ██╔══██╗██╔══██╗██║   ██║  ██║██╔═══██╗ 
@@ -21,8 +21,8 @@ func banner() string {
 `
 }
 
-func main() {
-	fmt.Println(banner())
+func StartServer() {
+	fmt.Println(serverBanner())
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	listen := flag.String("listen", ":9000", "Rahio server listen address")
 	chunkSize := flag.Int("chunk", 32*1024, "Chunk size")
