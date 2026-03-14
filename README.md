@@ -33,6 +33,28 @@ Packets are assigned monotonic sequence numbers, distributed across subflows by 
 | Flow control | `conn.go` | ✅ Done |
 | Failover | `conn.go` additions | 🔲 Pending |
 
+## Quick Start
+Initiate the `Rahio` server by executing the following command in a terminal shell:
+```shell
+# --listen :9000: Start the server and listen on port 9000
+# --chunk 32: Configure each request packet as 32 bytes
+go run main.go server --listen :9000 --chunk 32
+```
+
+Launch the `Rahio` server in a separate terminal session by executing the following command:
+```shell
+# --proxy: Specifies a localhost socks5 proxy to pass machine traffic through.
+# --server 127.0.0.01:9000: Specifies the `Rahio` server to connect to.
+# --ifaces lo0,lo0: Specifies a comma-separated list of network interfaces. For ease of startup, we repeated the localhost loopback interface twice.
+# --chunk 32: Configures each response packet as 32 bytes.
+go run main.go client --proxy 127.0.0.1:1080 --server 127.0.0.1:9000 --ifaces lo0,lo0 --chunk 32
+```
+
+Initiate a request through the client's proxy by executing the following command:
+```shell
+curl --proxy socks5://127.0.0.1:1080 https://ifconfig.me
+```
+
 ## Requirements
 
 - Go 1.21+
